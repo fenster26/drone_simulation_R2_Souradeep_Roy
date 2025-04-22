@@ -1,0 +1,109 @@
+import asyncio
+import websockets
+import json
+import re
+
+# Pattern to extract telemetry data
+TELEMETRY_PATTERN = (
+    r"X-(?P<x>-?\d+)-Y-(?P<y>-?\d+)-BAT-(?P<battery>\d+)-"
+    r"GYR-\[(?P<gx>-?\d+),(?P<gy>-?P<gz>-?\d+)\]-"
+    r"WIND-(?P<wind>\d+)-DUST-(?P<dust>\d+)-SENS-(?P<sensor>GREEN|YELLOW|RED)"
+)
+
+# Compute altitude change based solely on sensor and tilt (no hardcoded flight levels)
+def get_altitude_change(current_altitude, sensor, gx, gy):
+    # Instrument-defined safe tilt limit
+    tilt = max(abs(gx), abs(gy))
+    if tilt > 45:
+        # Too much tilt: descend to stabilize
+        return -1
+
+    # Follow instrument-defined safe altitudes for sensor status
+    if sensor == "RED":
+        # RED status: must stay below 3 units
+        return -1 if current_altitude >= 3 else 1
+    elif sensor == "YELLOW":
+        # YELLOW status: must stay below 1000 units
+        return -1 if current_altitude >= 1000 else 1
+    else:
+        # GREEN: safe range, hold altitude
+        return 0
+
+# Compute speed based on instrument battery reading (0-5)
+def get_speed(battery_level):
+    # Full throttle when battery healthy, slow down as battery drops
+    if battery_level >= 50:
+        return 5
+    if battery_level >= 20:
+        return 3
+    if battery_level >= 10:
+        return 1
+    # Critical battery, hover or prepare to land
+    return 0
+
+async def autopilot():
+    uri = "ws://localhost:8765"
+    try:
+        async with websockets.connect(uri) as ws:
+            print("Connected to Drone Server")
+
+            # Wait for initial telemetry before sending the first command
+            initial = await ws.recv()
+            data = json.loads(initial)
+
+            telemetry = data.get("telemetry", "")
+            match = re.match(TELEMETRY_PATTERN, telemetry)
+            if not match:
+                raise RuntimeError(f"Failed to parse initial telemetry: {telemetry}")
+
+            info = match.groupdict()
+            current_altitude = int(info["y"])
+            battery = int(info["battery"])
+            gx = int(info["gx"])
+            gy = int(info["gy"])
+            sensor = info["sensor"]
+
+            # Determine initial command from instruments
+            speed = get_speed(battery)
+            altitude_change = get_altitude_change(current_altitude, sensor, gx, gy)
+
+            await ws.send(json.dumps({"speed": speed, "altitude": altitude_change, "movement": "fwd"}))
+
+            # Main control loop
+            while True:
+                msg = await ws.recv()
+                data = json.loads(msg)
+
+                if data.get("status") == "crashed":
+                    print(" Drone crashed!", data)
+                    break
+
+                telemetry = data.get("telemetry", "")
+                match = re.match(TELEMETRY_PATTERN, telemetry)
+                if not match:
+                    print(" Telemetry parsing failed:", telemetry)
+                    continue
+
+                info = match.groupdict()
+                current_altitude = int(info["y"])
+                battery = int(info["battery"])
+                gx = int(info["gx"])
+                gy = int(info["gy"])
+                sensor = info["sensor"]
+
+                if battery == 0:
+                    print(" Battery depleted. Landing.")
+                    break
+
+                # Compute commands purely from instruments
+                speed = get_speed(battery)
+                altitude_change = get_altitude_change(current_altitude, sensor, gx, gy)
+
+                command = {"speed": speed, "altitude": altitude_change, "movement": "fwd"}
+                await ws.send(json.dumps(command))
+                await asyncio.sleep(0.25)
+    except Exception as e:
+        print("🚨 Error:", e)
+
+if __name__ == "__main__":
+    asyncio.run(autopilot())
